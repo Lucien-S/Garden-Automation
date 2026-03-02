@@ -200,7 +200,7 @@ static String wizReadLine() {
             if (c == '\n' || c == '\r') {
                 s.trim();
                 if (s.length() > 0) {
-                    // Drain any trailing \r or \n (handles \r\n pairs)
+                    Serial.println();  // newline après la saisie
                     delay(5);
                     while (Serial.available()) {
                         char next = (char)Serial.peek();
@@ -212,6 +212,7 @@ static String wizReadLine() {
                 // s still empty: lone \r or \n before content, keep reading
             } else {
                 s += c;
+                Serial.write(c);  // echo du caractère → l'utilisateur voit ce qu'il tape
             }
         }
         yield();    // nourrit le watchdog FreeRTOS, évite le reboot silencieux
