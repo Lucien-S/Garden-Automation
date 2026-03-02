@@ -197,11 +197,22 @@ static String wizReadLine() {
     while (millis() - start < 30000) {
         while (Serial.available()) {
             char c = (char)Serial.read();
-            if (c == '\n') {
+            if (c == '\n' || c == '\r') {
                 s.trim();
-                return s;
+                if (s.length() > 0) {
+                    // Drain any trailing \r or \n (handles \r\n pairs)
+                    delay(5);
+                    while (Serial.available()) {
+                        char next = (char)Serial.peek();
+                        if (next == '\r' || next == '\n') Serial.read();
+                        else break;
+                    }
+                    return s;
+                }
+                // s still empty: lone \r or \n before content, keep reading
+            } else {
+                s += c;
             }
-            if (c != '\r') s += c;
         }
         yield();    // nourrit le watchdog FreeRTOS, évite le reboot silencieux
         delay(10);
