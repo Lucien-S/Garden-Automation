@@ -73,14 +73,14 @@ struct CalibData {
 };
 
 struct Config {
-    uint8_t evForSensor1 = 1;
-    uint8_t evForSensor2 = 3;
-    uint8_t wateringDays = 10;
+    uint8_t evMaskSensor1 = 0b001;  // bitmask: bit0=EV1 bit1=EV2 bit2=EV3
+    uint8_t evMaskSensor2 = 0b100;
+    uint8_t wateringDays  = 10;
 };
 
 struct WateringState {
     bool          pumpActive               = false;
-    uint8_t       activeValve              = 0;
+    uint8_t       activeValveMask          = 0;
     unsigned long cycleStartTime           = 0;
     unsigned long maxDuration              = 0;
     unsigned long lastCycleTime[3]         = {0, 0, 0};
@@ -114,7 +114,8 @@ constexpr char NVS_S1_DRY[]     = "s1_dry";
 constexpr char NVS_S1_WET[]     = "s1_wet";
 constexpr char NVS_S2_DRY[]     = "s2_dry";
 constexpr char NVS_S2_WET[]     = "s2_wet";
-constexpr char NVS_EV_MAP[]     = "ev_map";
+constexpr char NVS_EV_MASK1[]   = "ev_mask1";
+constexpr char NVS_EV_MASK2[]   = "ev_mask2";
 constexpr char NVS_WATER_DAYS[] = "water_days";
 constexpr char NVS_DAILY_USED[] = "daily_used";
 constexpr char NVS_LAST_DAY[]   = "last_day";
@@ -125,9 +126,8 @@ void loadNVS() {
     calibData.s1Wet     = prefs.getFloat(NVS_S1_WET, 100.0f);
     calibData.s2Dry     = prefs.getFloat(NVS_S2_DRY, 0.0f);
     calibData.s2Wet     = prefs.getFloat(NVS_S2_WET, 100.0f);
-    uint8_t evMap       = prefs.getUChar(NVS_EV_MAP, 0b00001101);
-    config.evForSensor1 = (evMap & 0x03);
-    config.evForSensor2 = ((evMap >> 2) & 0x03);
+    config.evMaskSensor1 = prefs.getUChar(NVS_EV_MASK1, 0b001);
+    config.evMaskSensor2 = prefs.getUChar(NVS_EV_MASK2, 0b100);
     config.wateringDays = prefs.getUChar(NVS_WATER_DAYS, 10);
     prefs.end();
 }
@@ -138,8 +138,8 @@ void saveNVS() {
     prefs.putFloat(NVS_S1_WET,    calibData.s1Wet);
     prefs.putFloat(NVS_S2_DRY,    calibData.s2Dry);
     prefs.putFloat(NVS_S2_WET,    calibData.s2Wet);
-    uint8_t evMap = (config.evForSensor1 & 0x03) | ((config.evForSensor2 & 0x03) << 2);
-    prefs.putUChar(NVS_EV_MAP,    evMap);
+    prefs.putUChar(NVS_EV_MASK1,   config.evMaskSensor1);
+    prefs.putUChar(NVS_EV_MASK2,   config.evMaskSensor2);
     prefs.putUChar(NVS_WATER_DAYS, config.wateringDays);
     prefs.putBool(NVS_CALIBRATED,  true);
     prefs.end();
@@ -174,6 +174,9 @@ void resetDailyUsedIfNewDay(uint8_t today) {
     }
     prefs.end();
 }
+
+// Forward declaration (défini dans la section HELPERS plus bas)
+static String evMaskToStr(uint8_t mask);
 
 // ============================================================
 // SERIAL — WIZARD (bloquant, utilisé dans setup() uniquement)
@@ -281,6 +284,37 @@ static int wizReadInt(const char* prompt, int minVal, int maxVal) {
     }
 }
 
+// Lit un masque d'EV. Accepte "1", "2", "3", "1/2", "1/3", "2/3", "1/2/3".
+// Retourne un bitmask (bit0=EV1, bit1=EV2, bit2=EV3).
+static uint8_t wizReadEVMask(const char* prompt) {
+    while (true) {
+        Serial.print(prompt);
+        String s = wizReadLine();
+        if (s.length() == 0) { Serial.println("  (rien recu, reessayez)"); continue; }
+        uint8_t mask = 0;
+        bool valid = true;
+        int start = 0;
+        for (int i = 0; i <= (int)s.length(); i++) {
+            if (i == (int)s.length() || s[i] == '/') {
+                String token = s.substring(start, i);
+                token.trim();
+                if (token.length() > 0) {
+                    int v = token.toInt();
+                    if (v >= 1 && v <= 3) mask |= (1u << (v - 1));
+                    else { valid = false; break; }
+                }
+                start = i + 1;
+            }
+        }
+        if (!valid || mask == 0) {
+            Serial.println("  -> Format invalide. Ex: 1  ou  1/2  ou  2/3");
+            continue;
+        }
+        Serial.printf("  -> %s\n", evMaskToStr(mask).c_str());
+        return mask;
+    }
+}
+
 // ============================================================
 // SERIAL — RUNTIME (non-bloquant, utilisé dans loop())
 // ============================================================
@@ -288,7 +322,7 @@ static int wizReadInt(const char* prompt, int minVal, int maxVal) {
 // Quand '\n' détecté → ligne complète → on la traite.
 // Jamais de blocage, jamais de delay.
 
-// Forward declaration
+// Forward declarations
 void processRuntimeCommand(const char* cmd);
 
 void handleSerialRuntime() {
@@ -315,7 +349,7 @@ void handleSerialRuntime() {
 // FORWARD DECLARATIONS
 // ============================================================
 void runTestMode();
-void startWateringCycle(uint8_t valveNumber, float maxL);
+void startWateringCycle(uint8_t valveMask, float maxL);
 void stopWateringCycle();
 SensorReading readSensorRaw(byte address);
 void printStatus();
@@ -345,9 +379,10 @@ void processRuntimeCommand(const char* raw) {
     float dailyMax = 10.0f / (float)config.wateringDays;
 
     if (strcmp(cmd, "WATER") == 0 && val) {
-        uint8_t v = (uint8_t)atoi(val);
-        if (v >= 1 && v <= 3) startWateringCycle(v, dailyMax);
-        else Serial.println("[CMD] Valve invalide (1-3)");
+        uint8_t zone = (uint8_t)atoi(val);
+        if (zone == 1)      startWateringCycle(config.evMaskSensor1, dailyMax);
+        else if (zone == 2) startWateringCycle(config.evMaskSensor2, dailyMax);
+        else Serial.println("[CMD] Zone invalide (1=capteur1, 2=capteur2)");
     }
     else if (strcmp(cmd, "STOP") == 0) {
         stopWateringCycle();
@@ -360,7 +395,7 @@ void processRuntimeCommand(const char* raw) {
         Serial.println("[CMD] Compteur journalier remis a zero.");
     }
     else {
-        Serial.printf("[CMD] Inconnu : '%s'. Cmds: WATER:1, STOP, STATUS, RESET_DAILY\n", raw);
+        Serial.printf("[CMD] Inconnu : '%s'. Cmds: WATER:1, WATER:2, STOP, STATUS, RESET_DAILY\n", raw);
     }
 }
 
@@ -369,6 +404,22 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     char buf[64] = {0};
     memcpy(buf, payload, min((size_t)length, sizeof(buf) - 1));
     processRuntimeCommand(buf);
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+// Convertit un masque en chaîne lisible: 0b011 → "EV1/EV2"
+static String evMaskToStr(uint8_t mask) {
+    String s = "";
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mask & (1u << i)) {
+            if (s.length() > 0) s += "/";
+            s += "EV" + String(i + 1);
+        }
+    }
+    if (s.length() == 0) s = "none";
+    return s;
 }
 
 // ============================================================
@@ -389,22 +440,23 @@ void setGPIO(uint8_t pin, bool state) {
     gpio_set_level(static_cast<gpio_num_t>(pin), state ? 1 : 0);
 }
 
-void openValve(uint8_t n) {
+void openValves(uint8_t mask) {
     const uint8_t pins[] = {cfg::EV1_PIN, cfg::EV2_PIN, cfg::EV3_PIN};
-    if (n < 1 || n > 3) return;
-    setGPIO(pins[n-1], true);
-    Serial.printf("Valve %d OUVERTE\n", n);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mask & (1u << i)) setGPIO(pins[i], true);
+    }
+    Serial.printf("%s OUVERTES\n", evMaskToStr(mask).c_str());
 }
 
-void closeValve(uint8_t n) {
+void closeValves(uint8_t mask) {
     const uint8_t pins[] = {cfg::EV1_PIN, cfg::EV2_PIN, cfg::EV3_PIN};
-    if (n < 1 || n > 3) return;
-    setGPIO(pins[n-1], false);
-    Serial.printf("Valve %d FERMEE\n", n);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mask & (1u << i)) setGPIO(pins[i], false);
+    }
 }
 
 void closeAllValves() {
-    for (uint8_t i = 1; i <= 3; i++) closeValve(i);
+    closeValves(0b111);
 }
 
 void activatePump() {
@@ -476,12 +528,14 @@ void printStatus() {
     Serial.println("=== STATUS ===");
     Serial.printf("Pompe: %s\n", wateringState.pumpActive ? "ON" : "OFF");
     if (wateringState.pumpActive)
-        Serial.printf("Valve active: EV%d | temps restant: %lus\n",
-            wateringState.activeValve,
+        Serial.printf("Valves actives: %s | temps restant: %lus\n",
+            evMaskToStr(wateringState.activeValveMask).c_str(),
             (wateringState.maxDuration - (millis() - wateringState.cycleStartTime)) / 1000);
     Serial.printf("Budget journalier: %.2f / %.2f L\n",
         getDailyUsedL(), 10.0f / (float)config.wateringDays);
-    Serial.printf("S1->EV%d  S2->EV%d\n", config.evForSensor1, config.evForSensor2);
+    Serial.printf("S1->%s  S2->%s\n",
+        evMaskToStr(config.evMaskSensor1).c_str(),
+        evMaskToStr(config.evMaskSensor2).c_str());
     Serial.println("==============");
 }
 
@@ -493,7 +547,7 @@ void runTestMode() {
     for (uint8_t v = 1; v <= 3; v++) {
         closeAllValves();
         delay(200);
-        openValve(v);
+        openValves(1u << (v - 1));
         activatePump();
         delay(5000);
         deactivatePump();
@@ -585,14 +639,16 @@ void runCalibrationWizard() {
             bool evOk = false;
             while (!evOk) {
                 Serial.println("\n--- Association capteurs <-> electrovannes ---");
-                int ev1 = wizReadInt("Capteur 1 -> EV numero (1/2/3) : ", 1, 3);
-                int ev2 = wizReadInt("Capteur 2 -> EV numero (1/2/3) : ", 1, 3);
-                Serial.printf("  S1->EV%d  S2->EV%d\n", ev1, ev2);
+                Serial.println("  Entrer 1, 2, 3 ou combinaison ex: 1/2");
+                uint8_t mask1 = wizReadEVMask("Capteur 1 -> EV(s) : ");
+                uint8_t mask2 = wizReadEVMask("Capteur 2 -> EV(s) : ");
+                Serial.printf("  S1->%s  S2->%s\n",
+                    evMaskToStr(mask1).c_str(), evMaskToStr(mask2).c_str());
                 Serial.print("Confirmer (o=ok, r=recommencer association) : ");
                 char c = wizReadChar();
                 if (c == 'o') {
-                    config.evForSensor1 = (uint8_t)ev1;
-                    config.evForSensor2 = (uint8_t)ev2;
+                    config.evMaskSensor1 = mask1;
+                    config.evMaskSensor2 = mask2;
                     evOk = true;
                 }
                 // tout autre char → recommencer l'association (pas le wizard complet)
@@ -640,8 +696,8 @@ float litersForDuration(unsigned long ms) {
     return (ms / 1000.0f) / 60.0f * 10.0f;
 }
 
-void startWateringCycle(uint8_t valveNumber, float maxL) {
-    if (valveNumber < 1 || valveNumber > 3) return;
+void startWateringCycle(uint8_t valveMask, float maxL) {
+    if (valveMask == 0 || valveMask > 0b111) return;
     if (wateringState.pumpActive) { Serial.println("Cycle deja actif."); return; }
 
     float used = getDailyUsedL();
@@ -651,26 +707,31 @@ void startWateringCycle(uint8_t valveNumber, float maxL) {
     }
 
     unsigned long now_ms = millis();
-    if (wateringState.lastCycleTime[valveNumber-1] > 0 &&
-        now_ms - wateringState.lastCycleTime[valveNumber-1] < cfg::COOLDOWN_MS) {
-        Serial.println("Cooldown actif, arrosage ignore.");
-        return;
+    for (uint8_t i = 0; i < 3; i++) {
+        if ((valveMask & (1u << i)) &&
+            wateringState.lastCycleTime[i] > 0 &&
+            now_ms - wateringState.lastCycleTime[i] < cfg::COOLDOWN_MS) {
+            Serial.println("Cooldown actif, arrosage ignore.");
+            return;
+        }
     }
 
     float remaining = maxL - used;
     unsigned long maxDur = (unsigned long)((remaining / 10.0f) * 60.0f * 1000.0f);
     unsigned long duration = min(cfg::WATER_DUR_MS, maxDur);
 
-    Serial.printf("Arrosage EV%d pendant %lus (reste %.2fL)\n",
-        valveNumber, duration/1000, remaining);
+    Serial.printf("Arrosage %s pendant %lus (reste %.2fL)\n",
+        evMaskToStr(valveMask).c_str(), duration / 1000, remaining);
     closeAllValves();
     delay(100);
-    openValve(valveNumber);
+    openValves(valveMask);
     activatePump();
-    wateringState.activeValve                  = valveNumber;
-    wateringState.cycleStartTime               = millis();
-    wateringState.maxDuration                  = duration;
-    wateringState.lastCycleTime[valveNumber-1] = now_ms;
+    wateringState.activeValveMask = valveMask;
+    wateringState.cycleStartTime  = millis();
+    wateringState.maxDuration     = duration;
+    for (uint8_t i = 0; i < 3; i++) {
+        if (valveMask & (1u << i)) wateringState.lastCycleTime[i] = now_ms;
+    }
 }
 
 void stopWateringCycle() {
@@ -680,12 +741,12 @@ void stopWateringCycle() {
     Serial.printf("Cycle stoppe. %.2fL utilises.\n", liters);
     deactivatePump();
     closeAllValves();
-    wateringState.activeValve    = 0;
-    wateringState.cycleStartTime = 0;
+    wateringState.activeValveMask = 0;
+    wateringState.cycleStartTime  = 0;
 }
 
 void checkWateringCycleTimeout() {
-    if (!wateringState.pumpActive || wateringState.activeValve == 0) return;
+    if (!wateringState.pumpActive || wateringState.activeValveMask == 0) return;
     if (millis() - wateringState.cycleStartTime >= wateringState.maxDuration) {
         Serial.println("Cycle termine (timeout).");
         stopWateringCycle();
@@ -696,13 +757,15 @@ void checkAutomaticWatering(const SensorReading& s1, const SensorReading& s2) {
     if (wateringState.pumpActive) return;
     float dailyMax = 10.0f / (float)config.wateringDays;
     if (s1.ok && s1.humidity < cfg::HUMIDITY_THRESHOLD) {
-        Serial.printf("S1 bas (%.1f%%) -> EV%d\n", s1.humidity, config.evForSensor1);
-        startWateringCycle(config.evForSensor1, dailyMax);
+        Serial.printf("S1 bas (%.1f%%) -> %s\n",
+            s1.humidity, evMaskToStr(config.evMaskSensor1).c_str());
+        startWateringCycle(config.evMaskSensor1, dailyMax);
         return;
     }
     if (s2.ok && s2.humidity < cfg::HUMIDITY_THRESHOLD) {
-        Serial.printf("S2 bas (%.1f%%) -> EV%d\n", s2.humidity, config.evForSensor2);
-        startWateringCycle(config.evForSensor2, dailyMax);
+        Serial.printf("S2 bas (%.1f%%) -> %s\n",
+            s2.humidity, evMaskToStr(config.evMaskSensor2).c_str());
+        startWateringCycle(config.evMaskSensor2, dailyMax);
     }
 }
 
@@ -812,7 +875,7 @@ void setup() {
 
     tryConnectMqtt();
 
-    Serial.println("Pret. Commandes: WATER:1, WATER:2, WATER:3, STOP, STATUS, RESET_DAILY");
+    Serial.println("Pret. Commandes: WATER:1 (capteur1), WATER:2 (capteur2), STOP, STATUS, RESET_DAILY");
 }
 
 // ============================================================
