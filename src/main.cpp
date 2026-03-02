@@ -221,14 +221,27 @@ static String wizReadLine() {
     return s;
 }
 
-// Attend un caractère unique (première lettre de la réponse).
-// Répète si ligne vide (utilisateur a juste appuyé Entrée).
-// Retourne '\0' après maxTries tentatives ratées.
-static char wizReadChar(uint8_t maxTries = 10) {
-    for (uint8_t i = 0; i < maxTries; i++) {
-        String s = wizReadLine();
-        if (s.length() > 0) return (char)tolower(s[0]);
-        Serial.println("  (rien recu, reessayez)");
+// Attend un caractère unique. Ignore les CR/LF isolés.
+// Retourne '\0' après 30 s de silence.
+static char wizReadChar() {
+    unsigned long start = millis();
+    while (millis() - start < 30000) {
+        if (Serial.available()) {
+            char c = (char)Serial.read();
+            if (c != '\r' && c != '\n') {
+                // Drain any trailing CR/LF
+                delay(10);
+                while (Serial.available()) {
+                    char nx = (char)Serial.peek();
+                    if (nx == '\r' || nx == '\n') Serial.read();
+                    else break;
+                }
+                return (char)tolower(c);
+            }
+            // Lone CR or LF — ignore, keep waiting
+        }
+        yield();
+        delay(10);
     }
     return '\0';
 }
@@ -240,9 +253,9 @@ static bool wizAskON(const char* question, bool defaultVal = false) {
         Serial.print(question);
         Serial.print(" (o/n) : ");
         char c = wizReadChar();
+        if (c == '\0') { Serial.println("  (rien recu, reessayez)"); continue; }
         if (c == 'o') { Serial.println("o"); return true;  }
         if (c == 'n') { Serial.println("n"); return false; }
-        if (c == '\0') break; // timeout
         Serial.printf("  -> '%c' non reconnu\n", c);
     }
     Serial.printf("  -> Defaut : %s\n", defaultVal ? "oui" : "non");
@@ -759,14 +772,15 @@ void setup() {
     Serial.setTimeout(30000);
     delay(500);
 
+    // EV3_PIN (GPIO3) = UART0 RX : ne pas le configurer en sortie avant le wizard
+    // sinon Serial.available() retourne toujours 0 (pin tiré bas).
+    // EV3 est initialisé APRÈS le wizard (voir plus bas).
     forceGPIOMode(cfg::PUMP_PIN);
     forceGPIOMode(cfg::EV1_PIN);
     forceGPIOMode(cfg::EV2_PIN);
-    forceGPIOMode(cfg::EV3_PIN);
     setGPIO(cfg::PUMP_PIN, false);
     setGPIO(cfg::EV1_PIN,  false);
     setGPIO(cfg::EV2_PIN,  false);
-    setGPIO(cfg::EV3_PIN,  false);
 
     rs485Serial.begin(4800, SERIAL_8N1, 16, 17);
     rs485Serial.setTimeout(300);
@@ -788,10 +802,11 @@ void setup() {
     startAccessPoint();
     runCalibrationWizard();
 
-    // Après le wizard → passer en mode non-bloquant pour loop()
-    // On vide le buffer, et le setTimeout long ne pose plus de problème
-    // car handleSerialRuntime() lit char par char sans jamais appeler
-    // readStringUntil().
+    // Wizard terminé → configurer EV3 (GPIO3) en sortie maintenant que
+    // la réception série n'est plus nécessaire pour le setup.
+    forceGPIOMode(cfg::EV3_PIN);
+    setGPIO(cfg::EV3_PIN, false);
+
     clearSerial();
 
     tryConnectMqtt();
