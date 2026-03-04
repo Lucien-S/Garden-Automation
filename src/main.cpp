@@ -58,8 +58,9 @@ namespace cfg {
     constexpr uint8_t  RTC_SCL            = 26;
 
     constexpr float    HUMIDITY_THRESHOLD = 30.0f;
-    constexpr unsigned long WATER_DUR_MS  = 30000UL;
-    constexpr unsigned long COOLDOWN_MS   = 120000UL;
+    constexpr unsigned long PRIME_DURATION_MS = 15000UL;  // amorçage pompe avant ouverture EV
+    constexpr unsigned long WATER_DUR_MS      = 30000UL;
+    constexpr unsigned long COOLDOWN_MS       = 120000UL;
     constexpr unsigned long SENSOR_READ_MS = 30000UL;  // lecture capteurs
     constexpr unsigned long SENSOR_LOG_MS  = 60000UL;  // affichage série
 }
@@ -86,9 +87,11 @@ struct Config {
 
 struct WateringState {
     bool          pumpActive               = false;
+    bool          isPriming               = false;  // true pendant les 15 s d'amorçage
     uint8_t       activeValveMask          = 0;
     uint8_t       activeZone               = 0;    // 1 = capteur1, 2 = capteur2
     unsigned long cycleStartTime           = 0;
+    unsigned long primingStartTime         = 0;
     unsigned long maxDuration              = 0;
     unsigned long lastCycleTime[3]         = {0, 0, 0};
 };
@@ -603,17 +606,18 @@ void printStatus() {
 // TEST MODE
 // ============================================================
 void runTestMode() {
-    Serial.println("Test: EV1->EV2->EV3, 5s chacune");
+    Serial.println("Test: amorcage pompe 15s, puis EV1->EV2->EV3 x 5s chacune");
+    closeAllValves();
+    activatePump();
+    delay(cfg::PRIME_DURATION_MS);  // remplissage des tuyaux
     for (uint8_t v = 1; v <= 3; v++) {
-        closeAllValves();
-        delay(200);
+        Serial.printf("  EV%d...\n", v);
         openValves(1u << (v - 1));
-        activatePump();
         delay(5000);
-        deactivatePump();
         closeAllValves();
         delay(500);
     }
+    deactivatePump();
     Serial.println("Test termine.");
 }
 
@@ -820,12 +824,15 @@ void startWateringCycle(uint8_t valveMask, uint8_t zone, float zoneMaxL) {
         zone, evMaskToStr(valveMask).c_str(), duration / 1000, remaining);
     closeAllValves();
     delay(100);
-    openValves(valveMask);
+    // Pompe en premier pour remplir les tuyaux ; les EV s'ouvrent après PRIME_DURATION_MS
     activatePump();
-    wateringState.activeValveMask = valveMask;
-    wateringState.activeZone      = zone;
-    wateringState.cycleStartTime  = millis();
-    wateringState.maxDuration     = duration;
+    wateringState.activeValveMask  = valveMask;
+    wateringState.activeZone       = zone;
+    wateringState.maxDuration      = duration;
+    wateringState.isPriming        = true;
+    wateringState.primingStartTime = millis();
+    wateringState.cycleStartTime   = 0;  // sera fixé quand les EV s'ouvrent
+    Serial.printf("Amorcage pompe %lus avant ouverture EV...\n", cfg::PRIME_DURATION_MS / 1000);
     for (uint8_t i = 0; i < 3; i++) {
         if (valveMask & (1u << i)) wateringState.lastCycleTime[i] = now_ms;
     }
@@ -833,23 +840,41 @@ void startWateringCycle(uint8_t valveMask, uint8_t zone, float zoneMaxL) {
 
 void stopWateringCycle() {
     if (!wateringState.pumpActive) return;
-    // Cap au temps prévu (les délais OS ne doivent pas gonfler la consommation)
-    unsigned long actual = millis() - wateringState.cycleStartTime;
-    unsigned long capped = min(actual, wateringState.maxDuration);
-    float liters = litersForDuration(capped);
     uint8_t z = wateringState.activeZone;
-    setDailyUsedL(z, getDailyUsedL(z) + liters);
-    Serial.printf("Cycle stoppe. %.2fL utilises (Z%d).\n", liters, z);
+    if (!wateringState.isPriming && wateringState.cycleStartTime > 0) {
+        // Phase d'arrosage active : comptabiliser le budget
+        unsigned long actual = millis() - wateringState.cycleStartTime;
+        unsigned long capped = min(actual, wateringState.maxDuration);
+        float liters = litersForDuration(capped);
+        setDailyUsedL(z, getDailyUsedL(z) + liters);
+        Serial.printf("Cycle stoppe. %.2fL utilises (Z%d).\n", liters, z);
+    } else {
+        Serial.println("Cycle stoppe pendant amorcage (budget inchange).");
+    }
     deactivatePump();
     closeAllValves();
-    wateringState.activeValveMask = 0;
-    wateringState.activeZone      = 0;
-    wateringState.cycleStartTime  = 0;
-    pendingPostWateringPublish    = true;
+    wateringState.activeValveMask  = 0;
+    wateringState.activeZone       = 0;
+    wateringState.cycleStartTime   = 0;
+    wateringState.isPriming        = false;
+    wateringState.primingStartTime = 0;
+    pendingPostWateringPublish     = true;
 }
 
 void checkWateringCycleTimeout() {
     if (!wateringState.pumpActive || wateringState.activeValveMask == 0) return;
+
+    if (wateringState.isPriming) {
+        // Phase d'amorçage : ouvrir les EV après PRIME_DURATION_MS
+        if (millis() - wateringState.primingStartTime >= cfg::PRIME_DURATION_MS) {
+            openValves(wateringState.activeValveMask);
+            wateringState.isPriming      = false;
+            wateringState.cycleStartTime = millis();
+            Serial.println("EV ouvertes, arrosage demarre.");
+        }
+        return;  // pas encore en phase d'arrosage
+    }
+
     if (millis() - wateringState.cycleStartTime >= wateringState.maxDuration) {
         Serial.println("Cycle termine (timeout).");
         stopWateringCycle();
