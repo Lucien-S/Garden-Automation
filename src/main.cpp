@@ -21,6 +21,7 @@
 #include <driver/gpio.h>
 #include <cstdio>
 #include <Preferences.h>
+#include "RTClib.h"
 
 // ============================================================
 // CONSTANTS
@@ -37,7 +38,7 @@ namespace cfg {
     constexpr uint16_t MQTT_PORT          = 1883;
     constexpr char     MQTT_CLIENT_ID[]   = "esp32-garden";
     constexpr char     MQTT_CMD_TOPIC[]   = "garden/valve/command";
-    constexpr unsigned long PUBLISH_MS    = 10000UL;
+    constexpr unsigned long PUBLISH_MS    = 300000UL;  // 5 min
 
     constexpr byte     SENSOR1_ADDR       = 0x01;
     constexpr byte     SENSOR2_ADDR       = 0x02;
@@ -53,9 +54,15 @@ namespace cfg {
     constexpr uint8_t  EV2_PIN            = 22;
     constexpr uint8_t  EV3_PIN            = 3;
 
+    constexpr uint8_t  RTC_SDA            = 25;
+    constexpr uint8_t  RTC_SCL            = 26;
+
     constexpr float    HUMIDITY_THRESHOLD = 30.0f;
-    constexpr unsigned long WATER_DUR_MS  = 30000UL;
-    constexpr unsigned long COOLDOWN_MS   = 120000UL;
+    constexpr unsigned long PRIME_DURATION_MS = 15000UL;  // amorçage pompe avant ouverture EV
+    constexpr unsigned long WATER_DUR_MS      = 30000UL;
+    constexpr unsigned long COOLDOWN_MS       = 120000UL;
+    constexpr unsigned long SENSOR_READ_MS = 30000UL;  // lecture capteurs
+    constexpr unsigned long SENSOR_LOG_MS  = 60000UL;  // affichage série
 }
 
 // ============================================================
@@ -73,15 +80,18 @@ struct CalibData {
 };
 
 struct Config {
-    uint8_t evForSensor1 = 1;
-    uint8_t evForSensor2 = 3;
-    uint8_t wateringDays = 10;
+    uint8_t evMaskSensor1 = 0b001;  // bitmask: bit0=EV1 bit1=EV2 bit2=EV3
+    uint8_t evMaskSensor2 = 0b100;
+    uint8_t wateringDays  = 10;
 };
 
 struct WateringState {
     bool          pumpActive               = false;
-    uint8_t       activeValve              = 0;
+    bool          isPriming               = false;  // true pendant les 15 s d'amorçage
+    uint8_t       activeValveMask          = 0;
+    uint8_t       activeZone               = 0;    // 1 = capteur1, 2 = capteur2
     unsigned long cycleStartTime           = 0;
+    unsigned long primingStartTime         = 0;
     unsigned long maxDuration              = 0;
     unsigned long lastCycleTime[3]         = {0, 0, 0};
 };
@@ -94,9 +104,18 @@ HardwareSerial   rs485Serial(2);
 Adafruit_SSD1306 display(cfg::SCREEN_W, cfg::SCREEN_H, &Wire, cfg::OLED_RESET);
 WiFiClient       wifiClient;
 PubSubClient     mqttClient(wifiClient);
+TwoWire          rtcWire(1);   // I2C bus 1 pour la RTC (SDA=25, SCL=26)
+RTC_DS3231       rtc;
+bool             rtcAvailable = false;
 
 byte          response[20];
-unsigned long lastPublish = 0;
+unsigned long lastPublish      = 0;
+unsigned long lastSensorRead   = 0;
+unsigned long lastSensorLog    = 0;
+unsigned long lastDailyCheck   = 0;
+unsigned long lastAlertTime    = 0;
+unsigned long lastMqttAttempt  = 0;
+bool   pendingPostWateringPublish = false;
 CalibData     calibData;
 Config        config;
 WateringState wateringState;
@@ -114,10 +133,12 @@ constexpr char NVS_S1_DRY[]     = "s1_dry";
 constexpr char NVS_S1_WET[]     = "s1_wet";
 constexpr char NVS_S2_DRY[]     = "s2_dry";
 constexpr char NVS_S2_WET[]     = "s2_wet";
-constexpr char NVS_EV_MAP[]     = "ev_map";
+constexpr char NVS_EV_MASK1[]   = "ev_mask1";
+constexpr char NVS_EV_MASK2[]   = "ev_mask2";
 constexpr char NVS_WATER_DAYS[] = "water_days";
-constexpr char NVS_DAILY_USED[] = "daily_used";
-constexpr char NVS_LAST_DAY[]   = "last_day";
+constexpr char NVS_DAILY_USED_Z1[] = "used_z1";
+constexpr char NVS_DAILY_USED_Z2[] = "used_z2";
+constexpr char NVS_LAST_DAY[]      = "last_day";
 
 void loadNVS() {
     prefs.begin(NVS_NS, true);
@@ -125,9 +146,8 @@ void loadNVS() {
     calibData.s1Wet     = prefs.getFloat(NVS_S1_WET, 100.0f);
     calibData.s2Dry     = prefs.getFloat(NVS_S2_DRY, 0.0f);
     calibData.s2Wet     = prefs.getFloat(NVS_S2_WET, 100.0f);
-    uint8_t evMap       = prefs.getUChar(NVS_EV_MAP, 0b00001101);
-    config.evForSensor1 = (evMap & 0x03);
-    config.evForSensor2 = ((evMap >> 2) & 0x03);
+    config.evMaskSensor1 = prefs.getUChar(NVS_EV_MASK1, 0b001);
+    config.evMaskSensor2 = prefs.getUChar(NVS_EV_MASK2, 0b100);
     config.wateringDays = prefs.getUChar(NVS_WATER_DAYS, 10);
     prefs.end();
 }
@@ -138,8 +158,8 @@ void saveNVS() {
     prefs.putFloat(NVS_S1_WET,    calibData.s1Wet);
     prefs.putFloat(NVS_S2_DRY,    calibData.s2Dry);
     prefs.putFloat(NVS_S2_WET,    calibData.s2Wet);
-    uint8_t evMap = (config.evForSensor1 & 0x03) | ((config.evForSensor2 & 0x03) << 2);
-    prefs.putUChar(NVS_EV_MAP,    evMap);
+    prefs.putUChar(NVS_EV_MASK1,   config.evMaskSensor1);
+    prefs.putUChar(NVS_EV_MASK2,   config.evMaskSensor2);
     prefs.putUChar(NVS_WATER_DAYS, config.wateringDays);
     prefs.putBool(NVS_CALIBRATED,  true);
     prefs.end();
@@ -152,28 +172,39 @@ bool isCalibrated() {
     return v;
 }
 
-float getDailyUsedL() {
+float getDailyUsedL(uint8_t zone) {
     prefs.begin(NVS_NS, true);
-    float v = prefs.getFloat(NVS_DAILY_USED, 0.0f);
+    const char* key = (zone == 1) ? NVS_DAILY_USED_Z1 : NVS_DAILY_USED_Z2;
+    float v = prefs.isKey(key) ? prefs.getFloat(key, 0.0f) : 0.0f;
     prefs.end();
     return v;
 }
 
-void setDailyUsedL(float v) {
+void setDailyUsedL(uint8_t zone, float v) {
     prefs.begin(NVS_NS, false);
-    prefs.putFloat(NVS_DAILY_USED, v);
+    prefs.putFloat(zone == 1 ? NVS_DAILY_USED_Z1 : NVS_DAILY_USED_Z2, v);
     prefs.end();
 }
 
-void resetDailyUsedIfNewDay(uint8_t today) {
+void resetDailyUsedIfNewDay() {
+    if (!rtcAvailable) return;  // sans RTC on ne connait pas le jour
+    uint8_t today = rtc.now().day();
     prefs.begin(NVS_NS, false);
     uint8_t last = prefs.getUChar(NVS_LAST_DAY, 0);
     if (last != today) {
-        prefs.putFloat(NVS_DAILY_USED, 0.0f);
+        prefs.putFloat(NVS_DAILY_USED_Z1, 0.0f);
+        prefs.putFloat(NVS_DAILY_USED_Z2, 0.0f);
         prefs.putUChar(NVS_LAST_DAY, today);
+        Serial.println("Nouveau jour: budgets zones remis a zero.");
     }
     prefs.end();
 }
+
+// Forward declarations (définies plus bas)
+static String  evMaskToStr(uint8_t mask);
+static float   computeZoneMax(uint8_t zone);
+void publishAlert(const char* msg);
+void publishPostWateringStatus();
 
 // ============================================================
 // SERIAL — WIZARD (bloquant, utilisé dans setup() uniquement)
@@ -281,6 +312,37 @@ static int wizReadInt(const char* prompt, int minVal, int maxVal) {
     }
 }
 
+// Lit un masque d'EV. Accepte "1", "2", "3", "1/2", "1/3", "2/3", "1/2/3".
+// Retourne un bitmask (bit0=EV1, bit1=EV2, bit2=EV3).
+static uint8_t wizReadEVMask(const char* prompt) {
+    while (true) {
+        Serial.print(prompt);
+        String s = wizReadLine();
+        if (s.length() == 0) { Serial.println("  (rien recu, reessayez)"); continue; }
+        uint8_t mask = 0;
+        bool valid = true;
+        int start = 0;
+        for (int i = 0; i <= (int)s.length(); i++) {
+            if (i == (int)s.length() || s[i] == '/') {
+                String token = s.substring(start, i);
+                token.trim();
+                if (token.length() > 0) {
+                    int v = token.toInt();
+                    if (v >= 1 && v <= 3) mask |= (1u << (v - 1));
+                    else { valid = false; break; }
+                }
+                start = i + 1;
+            }
+        }
+        if (!valid || mask == 0) {
+            Serial.println("  -> Format invalide. Ex: 1  ou  1/2  ou  2/3");
+            continue;
+        }
+        Serial.printf("  -> %s\n", evMaskToStr(mask).c_str());
+        return mask;
+    }
+}
+
 // ============================================================
 // SERIAL — RUNTIME (non-bloquant, utilisé dans loop())
 // ============================================================
@@ -288,7 +350,7 @@ static int wizReadInt(const char* prompt, int minVal, int maxVal) {
 // Quand '\n' détecté → ligne complète → on la traite.
 // Jamais de blocage, jamais de delay.
 
-// Forward declaration
+// Forward declarations
 void processRuntimeCommand(const char* cmd);
 
 void handleSerialRuntime() {
@@ -315,7 +377,7 @@ void handleSerialRuntime() {
 // FORWARD DECLARATIONS
 // ============================================================
 void runTestMode();
-void startWateringCycle(uint8_t valveNumber, float maxL);
+void startWateringCycle(uint8_t valveMask, uint8_t zone, float zoneMaxL);
 void stopWateringCycle();
 SensorReading readSensorRaw(byte address);
 void printStatus();
@@ -342,12 +404,11 @@ void processRuntimeCommand(const char* raw) {
     // Tout en majuscules pour comparaison insensible à la casse
     for (char* p = cmd; *p; p++) *p = toupper(*p);
 
-    float dailyMax = 10.0f / (float)config.wateringDays;
-
     if (strcmp(cmd, "WATER") == 0 && val) {
-        uint8_t v = (uint8_t)atoi(val);
-        if (v >= 1 && v <= 3) startWateringCycle(v, dailyMax);
-        else Serial.println("[CMD] Valve invalide (1-3)");
+        uint8_t zone = (uint8_t)atoi(val);
+        if (zone == 1)      startWateringCycle(config.evMaskSensor1, 1, computeZoneMax(1));
+        else if (zone == 2) startWateringCycle(config.evMaskSensor2, 2, computeZoneMax(2));
+        else Serial.println("[CMD] Zone invalide (1=capteur1, 2=capteur2)");
     }
     else if (strcmp(cmd, "STOP") == 0) {
         stopWateringCycle();
@@ -356,11 +417,12 @@ void processRuntimeCommand(const char* raw) {
         printStatus();
     }
     else if (strcmp(cmd, "RESET_DAILY") == 0) {
-        setDailyUsedL(0.0f);
-        Serial.println("[CMD] Compteur journalier remis a zero.");
+        setDailyUsedL(1, 0.0f);
+        setDailyUsedL(2, 0.0f);
+        Serial.println("[CMD] Compteurs journaliers remis a zero.");
     }
     else {
-        Serial.printf("[CMD] Inconnu : '%s'. Cmds: WATER:1, STOP, STATUS, RESET_DAILY\n", raw);
+        Serial.printf("[CMD] Inconnu : '%s'. Cmds: WATER:1, WATER:2, STOP, STATUS, RESET_DAILY\n", raw);
     }
 }
 
@@ -369,6 +431,52 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     char buf[64] = {0};
     memcpy(buf, payload, min((size_t)length, sizeof(buf) - 1));
     processRuntimeCommand(buf);
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+static uint8_t countBits(uint8_t mask) {
+    uint8_t n = 0;
+    while (mask) { n += mask & 1u; mask >>= 1; }
+    return n;
+}
+
+// Budget journalier d'une zone, proportionnel à son nombre d'EV.
+// Ex: 3 EV total, zone1=2 EV → zone1 reçoit 2/3 du budget total.
+static float computeZoneMax(uint8_t zone) {
+    float    totalMax = 10.0f / (float)config.wateringDays;
+    uint8_t  ev1      = countBits(config.evMaskSensor1);
+    uint8_t  ev2      = countBits(config.evMaskSensor2);
+    uint8_t  total    = ev1 + ev2;
+    if (total == 0) return totalMax / 2.0f;
+    return totalMax * (float)(zone == 1 ? ev1 : ev2) / (float)total;
+}
+
+// Vrai si on est dans une fenêtre d'arrosage automatique (6h ou 20h)
+static bool isWateringWindow() {
+    if (!rtcAvailable) return true;  // sans RTC: toujours actif
+    uint8_t h = rtc.now().hour();
+    return (h == 6 || h == 20);
+}
+
+// Vrai si on est dans la session du soir (20h+), utilisé pour emprunter budget Z2
+static bool isEveningSession() {
+    if (!rtcAvailable) return false;
+    return rtc.now().hour() >= 20;
+}
+
+// Convertit un masque en chaîne lisible: 0b011 → "EV1/EV2"
+static String evMaskToStr(uint8_t mask) {
+    String s = "";
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mask & (1u << i)) {
+            if (s.length() > 0) s += "/";
+            s += "EV" + String(i + 1);
+        }
+    }
+    if (s.length() == 0) s = "none";
+    return s;
 }
 
 // ============================================================
@@ -389,22 +497,23 @@ void setGPIO(uint8_t pin, bool state) {
     gpio_set_level(static_cast<gpio_num_t>(pin), state ? 1 : 0);
 }
 
-void openValve(uint8_t n) {
+void openValves(uint8_t mask) {
     const uint8_t pins[] = {cfg::EV1_PIN, cfg::EV2_PIN, cfg::EV3_PIN};
-    if (n < 1 || n > 3) return;
-    setGPIO(pins[n-1], true);
-    Serial.printf("Valve %d OUVERTE\n", n);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mask & (1u << i)) setGPIO(pins[i], true);
+    }
+    Serial.printf("%s OUVERTES\n", evMaskToStr(mask).c_str());
 }
 
-void closeValve(uint8_t n) {
+void closeValves(uint8_t mask) {
     const uint8_t pins[] = {cfg::EV1_PIN, cfg::EV2_PIN, cfg::EV3_PIN};
-    if (n < 1 || n > 3) return;
-    setGPIO(pins[n-1], false);
-    Serial.printf("Valve %d FERMEE\n", n);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (mask & (1u << i)) setGPIO(pins[i], false);
+    }
 }
 
 void closeAllValves() {
-    for (uint8_t i = 1; i <= 3; i++) closeValve(i);
+    closeValves(0b111);
 }
 
 void activatePump() {
@@ -458,12 +567,13 @@ float rawToPercent(float raw, float dry, float wet) {
     return pct;
 }
 
-SensorReading readSensor(byte address, float dry, float wet) {
+SensorReading readSensor(byte address, float dry, float wet, bool verbose = false) {
     SensorReading r = readSensorRaw(address);
     if (r.ok) {
         r.humidity = rawToPercent(r.humidity, dry, wet);
-        Serial.printf("Sensor 0x%02X -> H:%.1f%% T:%.1fC\n", address, r.humidity, r.temperature);
-    } else {
+        if (verbose)
+            Serial.printf("Sensor 0x%02X -> H:%.1f%% T:%.1fC\n", address, r.humidity, r.temperature);
+    } else if (verbose) {
         Serial.printf("Sensor 0x%02X -> pas de reponse\n", address);
     }
     return r;
@@ -474,14 +584,21 @@ SensorReading readSensor(byte address, float dry, float wet) {
 // ============================================================
 void printStatus() {
     Serial.println("=== STATUS ===");
+    if (rtcAvailable) {
+        DateTime now = rtc.now();
+        Serial.printf("Heure: %04d/%02d/%02d %02d:%02d:%02d\n",
+            now.year(), now.month(), now.day(),
+            now.hour(), now.minute(), now.second());
+    }
     Serial.printf("Pompe: %s\n", wateringState.pumpActive ? "ON" : "OFF");
     if (wateringState.pumpActive)
-        Serial.printf("Valve active: EV%d | temps restant: %lus\n",
-            wateringState.activeValve,
+        Serial.printf("Valves: %s | temps restant: %lus\n",
+            evMaskToStr(wateringState.activeValveMask).c_str(),
             (wateringState.maxDuration - (millis() - wateringState.cycleStartTime)) / 1000);
-    Serial.printf("Budget journalier: %.2f / %.2f L\n",
-        getDailyUsedL(), 10.0f / (float)config.wateringDays);
-    Serial.printf("S1->EV%d  S2->EV%d\n", config.evForSensor1, config.evForSensor2);
+    float zm1 = computeZoneMax(1), zm2 = computeZoneMax(2);
+    Serial.printf("Budget Z1(%s): %.2f/%.2fL  Z2(%s): %.2f/%.2fL\n",
+        evMaskToStr(config.evMaskSensor1).c_str(), getDailyUsedL(1), zm1,
+        evMaskToStr(config.evMaskSensor2).c_str(), getDailyUsedL(2), zm2);
     Serial.println("==============");
 }
 
@@ -489,17 +606,18 @@ void printStatus() {
 // TEST MODE
 // ============================================================
 void runTestMode() {
-    Serial.println("Test: EV1->EV2->EV3, 5s chacune");
+    Serial.println("Test: amorcage pompe 15s, puis EV1->EV2->EV3 x 5s chacune");
+    closeAllValves();
+    activatePump();
+    delay(cfg::PRIME_DURATION_MS);  // remplissage des tuyaux
     for (uint8_t v = 1; v <= 3; v++) {
-        closeAllValves();
-        delay(200);
-        openValve(v);
-        activatePump();
+        Serial.printf("  EV%d...\n", v);
+        openValves(1u << (v - 1));
         delay(5000);
-        deactivatePump();
         closeAllValves();
         delay(500);
     }
+    deactivatePump();
     Serial.println("Test termine.");
 }
 
@@ -560,6 +678,42 @@ void runCalibrationWizard() {
         Serial.println(" Tape 'r' n'importe quand pour recommencer");
         Serial.println("========================================");
 
+        // ----- Heure RTC -----
+        if (rtcAvailable) {
+            bool lostPower = rtc.lostPower();
+            bool timeOk = false;
+            while (!timeOk) {
+                DateTime now = rtc.now();
+                Serial.printf("\nHeure: %04d/%02d/%02d %02d:%02d:%02d",
+                    now.year(), now.month(), now.day(),
+                    now.hour(), now.minute(), now.second());
+                if (lostPower) Serial.print("  [BATTERIE RTC vide!]");
+                Serial.println();
+                Serial.println("  o = heure correcte");
+                Serial.println("  c = regler a l'heure de compilation");
+                Serial.println("  m = saisir manuellement");
+                Serial.print("Choix : ");
+                char ch = wizReadChar();
+                if (ch == 'o') {
+                    timeOk = true;
+                } else if (ch == 'c') {
+                    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+                    Serial.println("Regle sur l'heure de compilation.");
+                    lostPower = false;
+                } else if (ch == 'm') {
+                    int yr = wizReadInt("Annee (ex: 2026) : ", 2024, 2100);
+                    int mo = wizReadInt("Mois (1-12) : ", 1, 12);
+                    int dy = wizReadInt("Jour (1-31) : ", 1, 31);
+                    int hr = wizReadInt("Heure (0-23) : ", 0, 23);
+                    int mn = wizReadInt("Minute (0-59) : ", 0, 59);
+                    rtc.adjust(DateTime(yr, mo, dy, hr, mn, 0));
+                    lostPower = false;
+                }
+            }
+        } else {
+            Serial.println("\nRTC non trouvee - fonctionnement sans horloge.");
+        }
+
         // ----- Calibration -----
         if (wizAskON("\nCalibrer les capteurs maintenant")) {
             calibrateSensor("Capteur 1", cfg::SENSOR1_ADDR, calibData.s1Dry, calibData.s1Wet);
@@ -585,14 +739,16 @@ void runCalibrationWizard() {
             bool evOk = false;
             while (!evOk) {
                 Serial.println("\n--- Association capteurs <-> electrovannes ---");
-                int ev1 = wizReadInt("Capteur 1 -> EV numero (1/2/3) : ", 1, 3);
-                int ev2 = wizReadInt("Capteur 2 -> EV numero (1/2/3) : ", 1, 3);
-                Serial.printf("  S1->EV%d  S2->EV%d\n", ev1, ev2);
+                Serial.println("  Entrer 1, 2, 3 ou combinaison ex: 1/2");
+                uint8_t mask1 = wizReadEVMask("Capteur 1 -> EV(s) : ");
+                uint8_t mask2 = wizReadEVMask("Capteur 2 -> EV(s) : ");
+                Serial.printf("  S1->%s  S2->%s\n",
+                    evMaskToStr(mask1).c_str(), evMaskToStr(mask2).c_str());
                 Serial.print("Confirmer (o=ok, r=recommencer association) : ");
                 char c = wizReadChar();
                 if (c == 'o') {
-                    config.evForSensor1 = (uint8_t)ev1;
-                    config.evForSensor2 = (uint8_t)ev2;
+                    config.evMaskSensor1 = mask1;
+                    config.evMaskSensor2 = mask2;
                     evOk = true;
                 }
                 // tout autre char → recommencer l'association (pas le wizard complet)
@@ -640,52 +796,85 @@ float litersForDuration(unsigned long ms) {
     return (ms / 1000.0f) / 60.0f * 10.0f;
 }
 
-void startWateringCycle(uint8_t valveNumber, float maxL) {
-    if (valveNumber < 1 || valveNumber > 3) return;
+void startWateringCycle(uint8_t valveMask, uint8_t zone, float zoneMaxL) {
+    if (valveMask == 0 || valveMask > 0b111 || zone < 1 || zone > 2) return;
     if (wateringState.pumpActive) { Serial.println("Cycle deja actif."); return; }
 
-    float used = getDailyUsedL();
-    if (used >= maxL) {
-        Serial.printf("Budget atteint (%.2f/%.2f L).\n", used, maxL);
+    float used = getDailyUsedL(zone);
+    if (used >= zoneMaxL) {
+        Serial.printf("Budget Z%d atteint (%.2f/%.2fL).\n", zone, used, zoneMaxL);
         return;
     }
 
     unsigned long now_ms = millis();
-    if (wateringState.lastCycleTime[valveNumber-1] > 0 &&
-        now_ms - wateringState.lastCycleTime[valveNumber-1] < cfg::COOLDOWN_MS) {
-        Serial.println("Cooldown actif, arrosage ignore.");
-        return;
+    for (uint8_t i = 0; i < 3; i++) {
+        if ((valveMask & (1u << i)) &&
+            wateringState.lastCycleTime[i] > 0 &&
+            now_ms - wateringState.lastCycleTime[i] < cfg::COOLDOWN_MS) {
+            Serial.println("Cooldown actif, arrosage ignore.");
+            return;
+        }
     }
 
-    float remaining = maxL - used;
+    float remaining = zoneMaxL - used;
     unsigned long maxDur = (unsigned long)((remaining / 10.0f) * 60.0f * 1000.0f);
     unsigned long duration = min(cfg::WATER_DUR_MS, maxDur);
 
-    Serial.printf("Arrosage EV%d pendant %lus (reste %.2fL)\n",
-        valveNumber, duration/1000, remaining);
+    Serial.printf("Arrosage Z%d %s pendant %lus (reste %.2fL)\n",
+        zone, evMaskToStr(valveMask).c_str(), duration / 1000, remaining);
     closeAllValves();
     delay(100);
-    openValve(valveNumber);
+    // Pompe en premier pour remplir les tuyaux ; les EV s'ouvrent après PRIME_DURATION_MS
     activatePump();
-    wateringState.activeValve                  = valveNumber;
-    wateringState.cycleStartTime               = millis();
-    wateringState.maxDuration                  = duration;
-    wateringState.lastCycleTime[valveNumber-1] = now_ms;
+    wateringState.activeValveMask  = valveMask;
+    wateringState.activeZone       = zone;
+    wateringState.maxDuration      = duration;
+    wateringState.isPriming        = true;
+    wateringState.primingStartTime = millis();
+    wateringState.cycleStartTime   = 0;  // sera fixé quand les EV s'ouvrent
+    Serial.printf("Amorcage pompe %lus avant ouverture EV...\n", cfg::PRIME_DURATION_MS / 1000);
+    for (uint8_t i = 0; i < 3; i++) {
+        if (valveMask & (1u << i)) wateringState.lastCycleTime[i] = now_ms;
+    }
 }
 
 void stopWateringCycle() {
     if (!wateringState.pumpActive) return;
-    float liters = litersForDuration(millis() - wateringState.cycleStartTime);
-    setDailyUsedL(getDailyUsedL() + liters);
-    Serial.printf("Cycle stoppe. %.2fL utilises.\n", liters);
+    uint8_t z = wateringState.activeZone;
+    if (!wateringState.isPriming && wateringState.cycleStartTime > 0) {
+        // Phase d'arrosage active : comptabiliser le budget
+        unsigned long actual = millis() - wateringState.cycleStartTime;
+        unsigned long capped = min(actual, wateringState.maxDuration);
+        float liters = litersForDuration(capped);
+        setDailyUsedL(z, getDailyUsedL(z) + liters);
+        Serial.printf("Cycle stoppe. %.2fL utilises (Z%d).\n", liters, z);
+    } else {
+        Serial.println("Cycle stoppe pendant amorcage (budget inchange).");
+    }
     deactivatePump();
     closeAllValves();
-    wateringState.activeValve    = 0;
-    wateringState.cycleStartTime = 0;
+    wateringState.activeValveMask  = 0;
+    wateringState.activeZone       = 0;
+    wateringState.cycleStartTime   = 0;
+    wateringState.isPriming        = false;
+    wateringState.primingStartTime = 0;
+    pendingPostWateringPublish     = true;
 }
 
 void checkWateringCycleTimeout() {
-    if (!wateringState.pumpActive || wateringState.activeValve == 0) return;
+    if (!wateringState.pumpActive || wateringState.activeValveMask == 0) return;
+
+    if (wateringState.isPriming) {
+        // Phase d'amorçage : ouvrir les EV après PRIME_DURATION_MS
+        if (millis() - wateringState.primingStartTime >= cfg::PRIME_DURATION_MS) {
+            openValves(wateringState.activeValveMask);
+            wateringState.isPriming      = false;
+            wateringState.cycleStartTime = millis();
+            Serial.println("EV ouvertes, arrosage demarre.");
+        }
+        return;  // pas encore en phase d'arrosage
+    }
+
     if (millis() - wateringState.cycleStartTime >= wateringState.maxDuration) {
         Serial.println("Cycle termine (timeout).");
         stopWateringCycle();
@@ -694,15 +883,61 @@ void checkWateringCycleTimeout() {
 
 void checkAutomaticWatering(const SensorReading& s1, const SensorReading& s2) {
     if (wateringState.pumpActive) return;
-    float dailyMax = 10.0f / (float)config.wateringDays;
+    if (!isWateringWindow()) return;  // uniquement à 6h et 20h
+
+    float zm1    = computeZoneMax(1);
+    float zm2    = computeZoneMax(2);
+    float used1  = getDailyUsedL(1);
+    float used2  = getDailyUsedL(2);
+    float avail1 = zm1 - used1;
+    float avail2 = zm2 - used2;
+
+    // ----- Zone 1 -----
     if (s1.ok && s1.humidity < cfg::HUMIDITY_THRESHOLD) {
-        Serial.printf("S1 bas (%.1f%%) -> EV%d\n", s1.humidity, config.evForSensor1);
-        startWateringCycle(config.evForSensor1, dailyMax);
-        return;
+        if (avail1 > 0) {
+            Serial.printf("S1 bas (%.1f%%) -> %s\n",
+                s1.humidity, evMaskToStr(config.evMaskSensor1).c_str());
+            startWateringCycle(config.evMaskSensor1, 1, zm1);
+            return;
+        }
+        // Budget Z1 épuisé. Le soir, emprunter le budget non utilisé de Z2
+        bool z2Satisfied = !s2.ok || s2.humidity >= cfg::HUMIDITY_THRESHOLD;
+        if (isEveningSession() && z2Satisfied && avail2 > 0) {
+            Serial.printf("S1 bas (%.1f%%), emprunte %.2fL de Z2 (soir)\n",
+                s1.humidity, avail2);
+            startWateringCycle(config.evMaskSensor1, 1, zm1 + avail2);
+            return;
+        }
+        // Vraiment à sec
+        if (millis() - lastAlertTime >= 600000UL) {
+            lastAlertTime = millis();
+            char msg[64];
+            bool reservoirVide = (avail1 <= 0 && avail2 <= 0);
+            if (reservoirVide)
+                snprintf(msg, sizeof(msg), "Reservoir vide - Z1(%s) a soif",
+                    evMaskToStr(config.evMaskSensor1).c_str());
+            else
+                snprintf(msg, sizeof(msg), "Z1(%s) a soif, budget epuise",
+                    evMaskToStr(config.evMaskSensor1).c_str());
+            publishAlert(msg);
+        }
     }
+
+    // ----- Zone 2 (vérifiée même si Z1 a épuisé son budget) -----
     if (s2.ok && s2.humidity < cfg::HUMIDITY_THRESHOLD) {
-        Serial.printf("S2 bas (%.1f%%) -> EV%d\n", s2.humidity, config.evForSensor2);
-        startWateringCycle(config.evForSensor2, dailyMax);
+        if (avail2 > 0) {
+            Serial.printf("S2 bas (%.1f%%) -> %s\n",
+                s2.humidity, evMaskToStr(config.evMaskSensor2).c_str());
+            startWateringCycle(config.evMaskSensor2, 2, zm2);
+        } else {
+            if (millis() - lastAlertTime >= 600000UL) {
+                lastAlertTime = millis();
+                char msg[64];
+                snprintf(msg, sizeof(msg), "Z2(%s) a soif, budget epuise",
+                    evMaskToStr(config.evMaskSensor2).c_str());
+                publishAlert(msg);
+            }
+        }
     }
 }
 
@@ -736,11 +971,16 @@ void startAccessPoint() {
 
 void tryConnectMqtt() {
     if (mqttClient.connected()) return;
+    unsigned long now = millis();
+    if (now - lastMqttAttempt < 30000UL) return;  // une tentative toutes les 30 s
+    lastMqttAttempt = now;
     mqttClient.setServer(cfg::MQTT_HOST, cfg::MQTT_PORT);
     mqttClient.setCallback(mqttCallback);
     if (mqttClient.connect(cfg::MQTT_CLIENT_ID)) {
         Serial.println("MQTT connecte.");
         mqttClient.subscribe(cfg::MQTT_CMD_TOPIC);
+    } else {
+        Serial.printf("MQTT echec (rc=%d), prochaine tentative dans 30s.\n", mqttClient.state());
     }
 }
 
@@ -758,6 +998,31 @@ void publishSensorReadings(uint8_t idx, const SensorReading& r) {
 void publishPumpState(bool state) {
     if (!mqttClient.connected()) return;
     mqttClient.publish("garden/pump/state", state ? "ON" : "OFF", true);
+}
+
+// Alerte "Soif" — publiée sur garden/alert/soif
+void publishAlert(const char* msg) {
+    Serial.printf("[ALERTE] %s\n", msg);
+    if (!mqttClient.connected()) return;
+    mqttClient.publish("garden/alert/soif", msg, false);
+}
+
+// Publié juste après la fin d'un cycle d'arrosage
+void publishPostWateringStatus() {
+    SensorReading ps1 = readSensor(cfg::SENSOR1_ADDR, calibData.s1Dry, calibData.s1Wet, true);
+    delay(200);
+    SensorReading ps2 = readSensor(cfg::SENSOR2_ADDR, calibData.s2Dry, calibData.s2Wet, true);
+    float zm1 = computeZoneMax(1), zm2 = computeZoneMax(2);
+    Serial.printf("Budget restant: Z1 %.2f/%.2fL  Z2 %.2f/%.2fL\n",
+        getDailyUsedL(1), zm1, getDailyUsedL(2), zm2);
+    if (!mqttClient.connected()) return;
+    publishSensorReadings(1, ps1);
+    publishSensorReadings(2, ps2);
+    publishPumpState(false);
+    char payload[64];
+    snprintf(payload, sizeof(payload), "Z1:%.2f/%.2fL Z2:%.2f/%.2fL",
+        getDailyUsedL(1), zm1, getDailyUsedL(2), zm2);
+    mqttClient.publish("garden/water/budget", payload, true);
 }
 
 // ============================================================
@@ -797,8 +1062,11 @@ void setup() {
     display.println("Demarrage...");
     display.display();
 
+    rtcWire.begin(cfg::RTC_SDA, cfg::RTC_SCL);
+    rtcAvailable = rtc.begin(&rtcWire);
+    if (!rtcAvailable) Serial.println("ATTENTION: RTC DS3231 non trouvee!");
+
     loadNVS();
-    setDailyUsedL(0.0f);
 
     startAccessPoint();
     runCalibrationWizard();
@@ -812,13 +1080,15 @@ void setup() {
 
     tryConnectMqtt();
 
-    Serial.println("Pret. Commandes: WATER:1, WATER:2, WATER:3, STOP, STATUS, RESET_DAILY");
+    Serial.println("Pret. Commandes: WATER:1 (capteur1), WATER:2 (capteur2), STOP, STATUS, RESET_DAILY");
 }
 
 // ============================================================
 // LOOP
 // ============================================================
 void loop() {
+    unsigned long now = millis();
+
     // 1. Commandes série (non-bloquant — char par char)
     handleSerialRuntime();
 
@@ -826,28 +1096,41 @@ void loop() {
     if (!mqttClient.connected()) tryConnectMqtt();
     mqttClient.loop();
 
-    // 3. Timeout arrosage
+    // 3. Timeout arrosage (vérifié à chaque itération)
     checkWateringCycleTimeout();
 
-    // 4. Lecture capteurs
-    SensorReading s1 = readSensor(cfg::SENSOR1_ADDR, calibData.s1Dry, calibData.s1Wet);
-    delay(200);
-    SensorReading s2 = readSensor(cfg::SENSOR2_ADDR, calibData.s2Dry, calibData.s2Wet);
-
-    // 5. Arrosage automatique
-    checkAutomaticWatering(s1, s2);
-
-    // 6. Affichage
-    updateDisplay(s1, s2);
-
-    // 7. Publication MQTT périodique
-    unsigned long now_ms = millis();
-    if (now_ms - lastPublish >= cfg::PUBLISH_MS) {
-        publishSensorReadings(1, s1);
-        publishSensorReadings(2, s2);
-        publishPumpState(wateringState.pumpActive);
-        lastPublish = now_ms;
+    // 3b. Publication post-arrosage (déclenché par stopWateringCycle)
+    if (pendingPostWateringPublish) {
+        pendingPostWateringPublish = false;
+        publishPostWateringStatus();
     }
 
-    delay(1000);
+    // 4. Remise à zéro journalière via RTC (toutes les 60 s)
+    if (now - lastDailyCheck >= 60000UL) {
+        lastDailyCheck = now;
+        resetDailyUsedIfNewDay();
+    }
+
+    // 5. Lecture capteurs toutes les 30 s
+    if (now - lastSensorRead >= cfg::SENSOR_READ_MS) {
+        lastSensorRead = now;
+        bool verbose = (now - lastSensorLog >= cfg::SENSOR_LOG_MS);
+        if (verbose) lastSensorLog = now;
+
+        SensorReading s1 = readSensor(cfg::SENSOR1_ADDR, calibData.s1Dry, calibData.s1Wet, verbose);
+        delay(200);
+        SensorReading s2 = readSensor(cfg::SENSOR2_ADDR, calibData.s2Dry, calibData.s2Wet, verbose);
+
+        checkAutomaticWatering(s1, s2);
+        updateDisplay(s1, s2);
+
+        if (now - lastPublish >= cfg::PUBLISH_MS) {
+            publishSensorReadings(1, s1);
+            publishSensorReadings(2, s2);
+            publishPumpState(wateringState.pumpActive);
+            lastPublish = now;
+        }
+    }
+
+    delay(100);
 }
