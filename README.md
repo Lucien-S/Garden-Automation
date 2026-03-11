@@ -4,7 +4,7 @@ Automated garden watering system based on ESP32, soil moisture sensors (RS485/Mo
 
 Youtube link: https://youtube.com/shorts/rQiWS8xde-I?feature=share 
 
-KiCad files are available in the folder /include
+KiCad files are available in the folder /kicad
 
 ---
 
