@@ -1,5 +1,7 @@
 # Garden Automation — ESP32
 
+![PCB overview with cables to pumps and electrovannes](images/overview.jpeg)
+
 Automated garden watering system based on ESP32, soil moisture sensors (RS485/Modbus), solenoid valves, and MQTT over WiFi.
 
 Youtube link: https://youtube.com/shorts/rQiWS8xde-I?feature=share 
