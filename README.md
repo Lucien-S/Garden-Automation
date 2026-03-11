@@ -4,7 +4,7 @@
 
 Automated garden watering system based on ESP32, soil moisture sensors (RS485/Modbus), solenoid valves, and MQTT over WiFi.
 
-Youtube link: https://youtube.com/shorts/rQiWS8xde-I?feature=share 
+Youtube link: [ https://youtube.com/shorts/rQiWS8xde-I?feature=share ](https://youtu.be/8DQGsPcLfHw)
 
 KiCad files are available in the folder /kicad
 
